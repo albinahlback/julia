@@ -31,6 +31,9 @@ end
 
 ## expressions ##
 
+isexpr(@nospecialize(ex), head::Symbol) = isa(ex, Expr) && ex.head === head
+isexpr(@nospecialize(ex), head::Symbol, n::Int) = isa(ex, Expr) && ex.head === head && length(ex.args) == n
+
 copy(e::Expr) = exprarray(e.head, copy_exprargs(e.args))
 
 # copy parts of an AST that the compiler mutates
@@ -408,7 +411,7 @@ the global scope or depending on mutable elements.
 See [Metaprogramming](@ref) for further details.
 
 ## Example:
-```julia
+```jldoctest
 julia> @generated function bar(x)
            if x <: Integer
                return :(x ^ 2)
@@ -440,5 +443,216 @@ macro generated(f)
                                         Expr(:return, nothing))))))
     else
         error("invalid syntax; @generated must be used with a function definition")
+    end
+end
+
+
+"""
+    @atomic var
+    @atomic order ex
+
+Mark `var` or `ex` as being performed atomically, if `ex` is a supported expression.
+
+See [atomics](#man-atomics) in the manual for more details.
+
+```jldoctest
+julia> mutable struct Atomic{T}; @atomic x::T; end
+
+julia> a = Atomic(1)
+Atomic{Int64}(1)
+
+julia> @atomic :sequentially_consistent a.x = 2 # set field x of a, with sequential consistency
+2
+
+julia> @atomic a.x # fetch field x of a, with sequential consistency
+2
+
+julia> @atomic a.x += 1 # increment field x of a, with sequential consistency
+3
+```
+"""
+macro atomic(ex)
+    if !isa(ex, Symbol) && !is_expr(ex, :(::))
+        return make_atomic(QuoteNode(:sequentially_consistent), ex)
+    end
+    return esc(Expr(:atomic, ex))
+end
+macro atomic(order, ex)
+    order isa QuoteNode || (order = esc(order))
+    return make_atomic(order, ex)
+end
+function make_atomic(order, ex)
+    @nospecialize
+    if ex isa Expr
+        if ex.head === :.
+            l, r = esc(ex.args[1]), esc(ex.args[2])
+            return :(getproperty($l, $r, $order))
+        elseif ex.head === :(=)
+            l, r = ex.args[1], ex.args[2]
+            if is_expr(l, :., 2)
+                ll, lr = esc(l.args[1]), esc(l.args[2])
+                return :(setproperty!($ll, $lr, $r, $order))
+            end
+        end
+        if length(ex.args) == 2
+            if ex.head === :(+=)
+                op = :+
+            elseif ex.head === :(-=)
+                op = :-
+            elseif @isdefined string
+                shead = string(ex.head)
+                if endswith(shead, '=')
+                    op = Symbol(shead[1:prevind(shead, end)])
+                end
+            end
+            if @isdefined(op)
+                l, r = ex.args[1], esc(ex.args[2])
+                is_expr(l, :.) || error("@atomic modify expression missing field access")
+                ll, lr, op = esc(l.args[1]), esc(l.args[2]), esc(op)
+                return :(modifyproperty!($ll, $lr, $op, $r, $order)[2])
+            end
+        end
+    end
+    error("could not parse @atomic expression $ex")
+end
+
+
+"""
+    @atomic! a.b.x max new()
+    @atomic! a.b.x + new()
+    @atomic! max(a.b.x, new())
+    @atomic! :acquire_release max(a.b.x, new())
+    @atomic! :acquire_release a.b.x + new()
+    @atomic! :acquire_release a.b.x max new()
+
+    @atomic! a.b.x = new()
+    @atomic! :acquire_release a.b.x = new()
+
+Perform the operation expressed on the right atomically, for the supported
+expressions shown, returning the values `(old, new)`.
+
+The first set of operations translates to a `modifyproperty!` call.
+The second set of operations translates to a `swapproperty!` call.
+
+See [atomics](#man-atomics) in the manual for more details.
+
+```jldoctest
+julia> mutable struct Atomic{T}; @atomic x::T; end
+
+julia> a = Atomic(1)
+Atomic{Int64}(1)
+
+julia> @atomic! :sequentially_consistent a.x = 2 # swap field x of a, with sequential consistency
+(1, 2)
+
+julia> @atomic a.x # fetch field x of a, with sequential consistency
+2
+
+julia> @atomic! a.x + 1 # increment field x of a, with sequential consistency
+(2, 3)
+
+julia> @atomic! max(a.x, 10) # change field x of a to the max value, with sequential consistency
+(3, 10)
+
+julia> @atomic! a.x max 5 # again change field x of a to the max value, with sequential consistency
+(10, 10)
+```
+"""
+macro atomic!(order, a1, op, a2)
+    order isa QuoteNode || (order = esc(order))
+    return make_atomic!(order, a1, op, a2)
+end
+macro atomic!(a1, op, a2)
+    return make_atomic!(QuoteNode(:sequentially_consistent), a1, op, a2)
+end
+macro atomic!(order, ex)
+    order isa QuoteNode || (order = esc(order))
+    return make_atomic!(order, ex)
+end
+macro atomic!(ex)
+    return make_atomic!(QuoteNode(:sequentially_consistent), ex)
+end
+function make_atomic!(order, ex)
+    @nospecialize
+    if ex isa Expr
+        if ex.head === :call
+            length(ex.args) == 3 || error("@atomic modify expression has the wrong number of function arguments")
+            return make_atomic!(order, ex.args[2], ex.args[1], ex.args[3])
+        elseif ex.head === :(=)
+            l, r = ex.args[1], ex.args[2]
+            is_expr(l, :., 2) || error("@atomic swap expression missing field access")
+            ll, lr = esc(l.args[1]), esc(l.args[2])
+            val = esc(r)
+            return :(local val = $val; (swapproperty!($ll, $lr, val, $order), val))
+        end
+    end
+    error("could not parse @atomic expression $ex")
+end
+function make_atomic!(order, a1, op, a2)
+    @nospecialize
+    is_expr(a1, :., 2) || error("@atomic modify expression missing field access")
+    a1l, a1r, op, a2 = esc(a1.args[1]), esc(a1.args[2]), esc(op), esc(a2)
+    return :(modifyproperty!($a1l, $a1r, $op, $a2, $order))
+end
+
+"""
+    @atomic_replace! a.b.x expected => desired
+    @atomic_replace! :sequentially_consistent a.b.x expected => desired
+    @atomic_replace! :sequentially_consistent :monotonic a.b.x expected => desired
+
+Perform the conditional replacement expressed by the pair atomically, returning
+the values `(old, success::Bool)`. Where `success` indicates whether the
+replacement was completed.
+
+This operation translates to a `replaceproperty!(a.b, :x, expected, desired)` call.
+
+See [atomics](#man-atomics) in the manual for more details.
+
+```jldoctest
+julia> mutable struct Atomic{T}; @atomic x::T; end
+
+julia> a = Atomic(1)
+Atomic{Int64}(1)
+
+julia> @atomic_replace! a.x 1 => 2 # replace field x of a with 2 if it was 1, with sequential consistency
+(1, true)
+
+julia> @atomic a.x # fetch field x of a, with sequential consistency
+2
+
+julia> @atomic_replace! a.x 1 => 2 # replace field x of a with 2 if it was 1, with sequential consistency
+(2, false)
+
+julia> xchg = 2 => 0; # replace field x of a with 0 if it was 1, with sequential consistency
+
+julia> @atomic_replace! a.x xchg
+(2, true)
+
+julia> @atomic a.x # fetch field x of a, with sequential consistency
+0
+```
+"""
+macro atomic_replace!(success_order, fail_order, ex, old_new)
+    fail_order isa QuoteNode || (fail_order = esc(fail_order))
+    success_order isa QuoteNode || (success_order = esc(success_order))
+    return make_atomic_replace!(success_order, fail_order, ex, old_new)
+end
+macro atomic_replace!(order, ex, old_new)
+    order isa QuoteNode || (order = esc(order))
+    return make_atomic_replace!(order, order, ex, old_new)
+end
+macro atomic_replace!(ex, old_new)
+    return make_atomic_replace!(QuoteNode(:sequentially_consistent), QuoteNode(:sequentially_consistent), ex, old_new)
+end
+function make_atomic_replace!(success_order, fail_order, ex, old_new)
+    @nospecialize
+    is_expr(ex, :., 2) || error("@atomic replace expression missing field access")
+    ll, lr = esc(ex.args[1]), esc(ex.args[2])
+    if is_expr(old_new, :call, 3) && old_new.args[1] === :(=>)
+        exp, rep = esc(old_new.args[2]), esc(old_new.args[3])
+        return :(replaceproperty!($ll, $lr, $exp, $rep, $success_order, $fail_order))
+    else
+        old_new = esc(old_new)
+        return :(local old_new = $old_new::Pair; replaceproperty!($ll, $lr, old_new[1], old_new[2], $success_order, $fail_order))
     end
 end
