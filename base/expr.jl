@@ -525,14 +525,10 @@ end
     @atomic! :acquire_release a.b.x + new()
     @atomic! :acquire_release a.b.x max new()
 
-    @atomic! a.b.x = new()
-    @atomic! :acquire_release a.b.x = new()
+Perform the binary operation expressed on the right atomically. Store the
+result into the field in the first argument and return the values `(old, new)`.
 
-Perform the operation expressed on the right atomically, for the supported
-expressions shown, returning the values `(old, new)`.
-
-The first set of operations translates to a `modifyproperty!` call.
-The second set of operations translates to a `swapproperty!` call.
+This operation translates to a `modifyproperty!(a.b, :x, func, arg2)` call.
 
 See [atomics](#man-atomics) in the manual for more details.
 
@@ -542,17 +538,14 @@ julia> mutable struct Atomic{T}; @atomic x::T; end
 julia> a = Atomic(1)
 Atomic{Int64}(1)
 
-julia> @atomic! :sequentially_consistent a.x = 2 # swap field x of a, with sequential consistency
+julia> @atomic! a.x + 1 # increment field x of a, with sequential consistency
 (1, 2)
 
 julia> @atomic a.x # fetch field x of a, with sequential consistency
 2
 
-julia> @atomic! a.x + 1 # increment field x of a, with sequential consistency
-(2, 3)
-
 julia> @atomic! max(a.x, 10) # change field x of a to the max value, with sequential consistency
-(3, 10)
+(2, 10)
 
 julia> @atomic! a.x max 5 # again change field x of a to the max value, with sequential consistency
 (10, 10)
@@ -574,26 +567,54 @@ macro atomic!(ex)
 end
 function make_atomic!(order, ex)
     @nospecialize
-    if ex isa Expr
-        if ex.head === :call
-            length(ex.args) == 3 || error("@atomic modify expression has the wrong number of function arguments")
-            return make_atomic!(order, ex.args[2], ex.args[1], ex.args[3])
-        elseif ex.head === :(=)
-            l, r = ex.args[1], ex.args[2]
-            is_expr(l, :., 2) || error("@atomic swap expression missing field access")
-            ll, lr = esc(l.args[1]), esc(l.args[2])
-            val = esc(r)
-            return :(local val = $val; (swapproperty!($ll, $lr, val, $order), val))
-        end
-    end
-    error("could not parse @atomic expression $ex")
+    isexpr(ex, :call, 3) || error("could not parse @atomic! modify expression $ex")
+    return make_atomic!(order, ex.args[2], ex.args[1], ex.args[3])
 end
 function make_atomic!(order, a1, op, a2)
     @nospecialize
-    is_expr(a1, :., 2) || error("@atomic modify expression missing field access")
+    is_expr(a1, :., 2) || error("@atomic! modify expression missing field access")
     a1l, a1r, op, a2 = esc(a1.args[1]), esc(a1.args[2]), esc(op), esc(a2)
     return :(modifyproperty!($a1l, $a1r, $op, $a2, $order))
 end
+
+
+"""
+    @atomic_swap! a.b.x new
+    @atomic_swap! :sequentially_consistent a.b.x new
+
+Stores `new` into `a.b.x` and returns the old value of `a.b.x`.
+
+This operation translates to a `swapproperty!(a.b, :x, new)` call.
+
+See [atomics](#man-atomics) in the manual for more details.
+
+```jldoctest
+julia> mutable struct Atomic{T}; @atomic x::T; end
+
+julia> a = Atomic(1)
+Atomic{Int64}(1)
+
+julia> @atomic_swap! a.x 2+2 # replace field x of a with 4, with sequential consistency
+1
+
+julia> @atomic a.x # fetch field x of a, with sequential consistency
+4
+```
+"""
+macro atomic_swap!(order, ex, val)
+    order isa QuoteNode || (order = esc(order))
+    return make_atomic_swap!(order, ex, val)
+end
+macro atomic_swap!(ex, val)
+    return make_atomic_swap!(QuoteNode(:sequentially_consistent), ex, val)
+end
+function make_atomic_swap!(order, ex, val)
+    @nospecialize
+    is_expr(ex, :., 2) || error("@atomic_swap! expression missing field access")
+    l, r, val = esc(ex.args[1]), esc(ex.args[2]), esc(val)
+    return :(swapproperty!($l, $r, $val, $order))
+end
+
 
 """
     @atomic_replace! a.b.x expected => desired
@@ -646,7 +667,7 @@ macro atomic_replace!(ex, old_new)
 end
 function make_atomic_replace!(success_order, fail_order, ex, old_new)
     @nospecialize
-    is_expr(ex, :., 2) || error("@atomic replace expression missing field access")
+    is_expr(ex, :., 2) || error("@atomic_replace! expression missing field access")
     ll, lr = esc(ex.args[1]), esc(ex.args[2])
     if is_expr(old_new, :call, 3) && old_new.args[1] === :(=>)
         exp, rep = esc(old_new.args[2]), esc(old_new.args[3])

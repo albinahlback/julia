@@ -317,10 +317,9 @@ let a = ARefxy(1, -1)
     @test_throws ConcurrencyViolationError @atomic! :not_atomic a.x max 30
 
     @test 20 === @atomic a.x
-    @test (20, 1) === @atomic! a.x = 1
-    @test (1, 2) === @atomic! :monotonic a.x = 2
-    @test_throws ConcurrencyViolationError @atomic! :not_atomic a.x = 1
-
+    @test 20 === @atomic_swap! a.x 1
+    @test 1 === @atomic_swap! :monotonic a.x 2
+    @test_throws ConcurrencyViolationError @atomic_swap! :not_atomic a.x 1
 
     @test 2 === @atomic a.x
     @test (2, true) === @atomic_replace! a.x 2 => 1

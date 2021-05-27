@@ -1018,6 +1018,7 @@ export
     @assert,
     @atomic,
     @atomic!,
+    @atomic_swap!,
     @atomic_replace!,
     @__dot__,
     @enum,
