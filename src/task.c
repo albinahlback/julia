@@ -559,14 +559,12 @@ JL_DLLEXPORT JL_NORETURN void jl_no_exc_handler(jl_value_t *e)
 // yield to exception handler
 static void JL_NORETURN throw_internal(jl_task_t *ct, jl_value_t *exception JL_MAYBE_UNROOTED)
 {
+    assert(!jl_get_safe_restore());
     jl_ptls_t ptls = ct->ptls;
     ptls->io_wait = 0;
     // @time needs its compile timer disabled on error,
     // and cannot use a try-finally as it would break scope for assignments
     jl_measure_compile_time[ptls->tid] = 0;
-    jl_jmp_buf *safe_restore = jl_get_safe_restore();
-    if (safe_restore)
-        jl_longjmp(*safe_restore, 1);
     JL_GC_PUSH1(&exception);
     jl_gc_unsafe_enter(ptls);
     if (exception) {
@@ -626,7 +624,11 @@ JL_DLLEXPORT void jl_rethrow(void)
 JL_DLLEXPORT void JL_NORETURN jl_sig_throw(void)
 {
 CFI_NORETURN
+    jl_jmp_buf *safe_restore = jl_get_safe_restore();
+    if (safe_restore)
+        jl_longjmp(*safe_restore, 1);
     jl_task_t *ct = jl_current_task;
+    JL_GC_PROMISE_ROOTED(ct);
     jl_ptls_t ptls = ct->ptls;
     jl_value_t *e = ptls->sig_exception;
     ptls->sig_exception = NULL;

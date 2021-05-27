@@ -199,11 +199,12 @@ static void jl_call_in_ctx(jl_ptls_t ptls, void (*fptr)(void), int sig, void *_c
 static void jl_throw_in_ctx(jl_task_t *ct, jl_value_t *e, int sig, void *sigctx)
 {
     jl_ptls_t ptls = ct->ptls;
-    if (!jl_get_safe_restore())
+    if (!jl_get_safe_restore()) {
         ptls->bt_size =
             rec_backtrace_ctx(ptls->bt_data, JL_MAX_BT_SIZE, jl_to_bt_context(sigctx),
                               ct->gcstack);
-    ptls->sig_exception = e;
+        ptls->sig_exception = e;
+    }
     jl_call_in_ctx(ptls, &jl_sig_throw, sig, sigctx);
 }
 
@@ -307,9 +308,15 @@ static int jl_is_on_sigstack(jl_ptls_t ptls, void *ptr, void *context)
 
 static void segv_handler(int sig, siginfo_t *info, void *context)
 {
+    if (jl_get_safe_restore()) { // restarting jl_ or profile
+        jl_call_in_ctx(NULL, &jl_sig_throw, sig, context);
+        return;
+    }
     jl_task_t *ct = jl_get_current_task();
-    if (ct == NULL)
+    if (ct == NULL) {
         sigdie_handler(sig, info, context);
+        return;
+    }
     assert(sig == SIGSEGV || sig == SIGBUS);
     if (jl_addr_is_safepoint((uintptr_t)info->si_addr)) {
         jl_set_gc_and_wait();
@@ -325,7 +332,7 @@ static void segv_handler(int sig, siginfo_t *info, void *context)
         }
         return;
     }
-    if (jl_get_safe_restore() || is_addr_on_stack(ct, info->si_addr)) { // stack overflow, or restarting jl_
+    if (is_addr_on_stack(ct, info->si_addr)) { // stack overflow
         jl_throw_in_ctx(ct, jl_stackovf_exception, sig, context);
     }
     else if (jl_is_on_sigstack(ct->ptls, info->si_addr, context)) {
@@ -437,7 +444,9 @@ static void jl_exit_thread0(int state, jl_bt_element_t *bt_data, size_t bt_size)
 // 3: exit with `thread0_exit_state`
 void usr2_handler(int sig, siginfo_t *info, void *ctx)
 {
-    jl_task_t *ct = jl_current_task;
+    jl_task_t *ct = jl_get_current_task();
+    if (ct == NULL)
+        return;
     jl_ptls_t ptls = ct->ptls;
     int errno_save = errno;
     sig_atomic_t request = jl_atomic_exchange(&ptls->signal_request, 0);
@@ -836,8 +845,15 @@ void restore_signals(void)
 static void fpe_handler(int sig, siginfo_t *info, void *context)
 {
     (void)info;
-    jl_task_t *ct = jl_current_task;
-    jl_throw_in_ctx(ct, jl_diverror_exception, sig, context);
+    if (jl_get_safe_restore()) { // restarting jl_ or profile
+        jl_call_in_ctx(NULL, &jl_sig_throw, sig, context);
+        return;
+    }
+    jl_task_t *ct = jl_get_current_task();
+    if (ct == NULL) // exception on foreign thread is fatal
+        sigdie_handler(sig, info, context);
+    else
+        jl_throw_in_ctx(ct, jl_diverror_exception, sig, context);
 }
 
 static void sigint_handler(int sig)
