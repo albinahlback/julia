@@ -297,16 +297,16 @@ test_field_undef(ARefxy{UndefComplex{UndefComplex{Any}}})
 # test macroexpansions
 let a = ARefxy(1, -1)
     @test 1 === @atomic a.x
-    @test 2 === @atomic :sequentially_consistent a.x = 2
-    @test 3 === @atomic :monotonic a.x = 3
-    @test_throws ConcurrencyViolationError @atomic :not_atomic a.x = 2
+    @test 2 === @atomic! :sequentially_consistent a.x = 2
+    @test 3 === @atomic! :monotonic a.x = 3
+    @test_throws ConcurrencyViolationError @atomic! :not_atomic a.x = 2
     @test_throws ConcurrencyViolationError @atomic :not_atomic a.x
-    @test_throws ConcurrencyViolationError @atomic :not_atomic a.x += 1
+    @test_throws ConcurrencyViolationError @atomic! :not_atomic a.x += 1
 
     @test 3 === @atomic :monotonic a.x
-    @test 5 === @atomic a.x += 2
-    @test 4 === @atomic :monotonic a.x -= 1
-    @test 12 === @atomic :monotonic a.x *= 3
+    @test 5 === @atomic! a.x += 2
+    @test 4 === @atomic! :monotonic a.x -= 1
+    @test 12 === @atomic! :monotonic a.x *= 3
 
     @test 12 === @atomic a.x
     @test (12, 13) === @atomic! a.x + 1

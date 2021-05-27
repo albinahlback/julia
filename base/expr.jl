@@ -461,14 +461,8 @@ julia> mutable struct Atomic{T}; @atomic x::T; end
 julia> a = Atomic(1)
 Atomic{Int64}(1)
 
-julia> @atomic :sequentially_consistent a.x = 2 # set field x of a, with sequential consistency
-2
-
 julia> @atomic a.x # fetch field x of a, with sequential consistency
-2
-
-julia> @atomic a.x += 1 # increment field x of a, with sequential consistency
-3
+1
 ```
 """
 macro atomic(ex)
@@ -483,10 +477,85 @@ macro atomic(order, ex)
 end
 function make_atomic(order, ex)
     @nospecialize
+    if isexpr(ex, :., 2)
+        l, r = esc(ex.args[1]), esc(ex.args[2])
+        return :(getproperty($l, $r, $order))
+    end
+    error("could not parse @atomic expression $ex")
+end
+
+
+"""
+    @atomic! a.b.x = new
+    @atomic! a.b.x += addend
+    @atomic! :acquire_release a.b.x = new
+    @atomic! :acquire_release a.b.x += addend
+
+Perform the store operation expressed on the right atomically and return the
+new value.
+
+With `=`, this operation translates to a `setproperty!(a.b, :x, new)` call.
+With any operator also, this operation translates to a `modifyproperty!(a.b,
+:x, +, addend)[2]` call.
+
+    @atomic! a.b.x max arg2
+    @atomic! a.b.x + arg2
+    @atomic! max(a.b.x, arg2)
+    @atomic! :acquire_release max(a.b.x, arg2)
+    @atomic! :acquire_release a.b.x + arg2
+    @atomic! :acquire_release a.b.x max arg2
+
+Perform the binary operation expressed on the right atomically. Store the
+result into the field in the first argument and return the values `(old, new)`.
+
+This operation translates to a `modifyproperty!(a.b, :x, func, arg2)` call.
+
+See [atomics](#man-atomics) in the manual for more details.
+
+```jldoctest
+julia> mutable struct Atomic{T}; @atomic x::T; end
+
+julia> a = Atomic(1)
+Atomic{Int64}(1)
+
+julia> @atomic! :sequentially_consistent a.x = 2 # set field x of a, with sequential consistency
+2
+
+julia> @atomic! a.x += 1 # increment field x of a, with sequential consistency
+3
+
+julia> @atomic! a.x + 1 # increment field x of a, with sequential consistency
+(3, 4)
+
+julia> @atomic a.x # fetch field x of a, with sequential consistency
+4
+
+julia> @atomic! max(a.x, 10) # change field x of a to the max value, with sequential consistency
+(4, 10)
+
+julia> @atomic! a.x max 5 # again change field x of a to the max value, with sequential consistency
+(10, 10)
+```
+"""
+macro atomic!(order, a1, op, a2)
+    order isa QuoteNode || (order = esc(order))
+    return make_atomic!(order, a1, op, a2)
+end
+macro atomic!(a1, op, a2)
+    return make_atomic!(QuoteNode(:sequentially_consistent), a1, op, a2)
+end
+macro atomic!(order, ex)
+    order isa QuoteNode || (order = esc(order))
+    return make_atomic!(order, ex)
+end
+macro atomic!(ex)
+    return make_atomic!(QuoteNode(:sequentially_consistent), ex)
+end
+function make_atomic!(order, ex)
+    @nospecialize
     if ex isa Expr
-        if ex.head === :.
-            l, r = esc(ex.args[1]), esc(ex.args[2])
-            return :(getproperty($l, $r, $order))
+        if isexpr(ex, :call, 3)
+            return make_atomic!(order, ex.args[2], ex.args[1], ex.args[3])
         elseif ex.head === :(=)
             l, r = ex.args[1], ex.args[2]
             if is_expr(l, :., 2)
@@ -513,62 +582,7 @@ function make_atomic(order, ex)
             end
         end
     end
-    error("could not parse @atomic expression $ex")
-end
-
-
-"""
-    @atomic! a.b.x max new()
-    @atomic! a.b.x + new()
-    @atomic! max(a.b.x, new())
-    @atomic! :acquire_release max(a.b.x, new())
-    @atomic! :acquire_release a.b.x + new()
-    @atomic! :acquire_release a.b.x max new()
-
-Perform the binary operation expressed on the right atomically. Store the
-result into the field in the first argument and return the values `(old, new)`.
-
-This operation translates to a `modifyproperty!(a.b, :x, func, arg2)` call.
-
-See [atomics](#man-atomics) in the manual for more details.
-
-```jldoctest
-julia> mutable struct Atomic{T}; @atomic x::T; end
-
-julia> a = Atomic(1)
-Atomic{Int64}(1)
-
-julia> @atomic! a.x + 1 # increment field x of a, with sequential consistency
-(1, 2)
-
-julia> @atomic a.x # fetch field x of a, with sequential consistency
-2
-
-julia> @atomic! max(a.x, 10) # change field x of a to the max value, with sequential consistency
-(2, 10)
-
-julia> @atomic! a.x max 5 # again change field x of a to the max value, with sequential consistency
-(10, 10)
-```
-"""
-macro atomic!(order, a1, op, a2)
-    order isa QuoteNode || (order = esc(order))
-    return make_atomic!(order, a1, op, a2)
-end
-macro atomic!(a1, op, a2)
-    return make_atomic!(QuoteNode(:sequentially_consistent), a1, op, a2)
-end
-macro atomic!(order, ex)
-    order isa QuoteNode || (order = esc(order))
-    return make_atomic!(order, ex)
-end
-macro atomic!(ex)
-    return make_atomic!(QuoteNode(:sequentially_consistent), ex)
-end
-function make_atomic!(order, ex)
-    @nospecialize
-    isexpr(ex, :call, 3) || error("could not parse @atomic! modify expression $ex")
-    return make_atomic!(order, ex.args[2], ex.args[1], ex.args[3])
+    error("could not parse @atomic! modify expression $ex")
 end
 function make_atomic!(order, a1, op, a2)
     @nospecialize
@@ -674,6 +688,6 @@ function make_atomic_replace!(success_order, fail_order, ex, old_new)
         return :(replaceproperty!($ll, $lr, $exp, $rep, $success_order, $fail_order))
     else
         old_new = esc(old_new)
-        return :(local old_new = $old_new::Pair; replaceproperty!($ll, $lr, old_new[1], old_new[2], $success_order, $fail_order))
+        return :(replaceproperty!($ll, $lr, $old_new::Pair..., $success_order, $fail_order))
     end
 end
